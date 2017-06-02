@@ -7680,28 +7680,32 @@ module.exports = {
 'use strict'
 
 module.exports = {
-  'segmentio': require('analytics.js-integration-segmentio'),
+  'vnda': require('./vnda')
 }
 
-}, {"analytics.js-integration-segmentio":82}],
+}, {"./vnda":82}],
 82: [function(require, module, exports) {
+'use strict';
 
 /**
  * Module dependencies.
  */
 
-var ads = require('ad-params');
-var clone = require('clone');
-var cookie = require('cookie');
-var extend = require('extend');
-var integration = require('analytics.js-integration');
-var json = require('segmentio/json@1.0.0');
-var localstorage = require('store');
-var protocol = require('protocol');
-var send = require('send-json');
-var topDomain = require('top-domain');
-var utm = require('utm-params');
-var uuid = require('uuid');
+var ads = require('@segment/ad-params');
+var clone = require('component-clone');
+var cookie = require('component-cookie');
+var extend = require('@ndhoule/extend');
+var integration = require('@segment/analytics.js-integration');
+var json = require('json3');
+var keys = require('@ndhoule/keys');
+var localstorage = require('yields-store');
+var md5 = require('spark-md5').hash;
+var protocol = require('@segment/protocol');
+var send = require('@segment/send-json');
+var topDomain = require('@segment/top-domain');
+var utm = require('@segment/utm-params');
+var uuid = require('uuid').v4;
+var Queue = require('@segment/localstorage-retry');
 
 /**
  * Cookie options
@@ -7719,7 +7723,13 @@ var cookieOptions = {
  */
 
 var Segment = exports = module.exports = integration('Segment.io')
-  .option('apiKey', '');
+  .option('apiKey', '')
+  .option('apiHost', 'api.segment.io/v1')
+  .option('crossDomainIdServers', [])
+  .option('beacon', false)
+  .option('retryQueue', false)
+  .option('addBundledMetadata', false)
+  .option('unbundledIntegrations', []);
 
 /**
  * Get the store.
@@ -7747,6 +7757,22 @@ exports.global = window;
 
 Segment.prototype.initialize = function() {
   var self = this;
+
+  if (this.options.retryQueue) {
+    this._lsqueue = new Queue('segmentio', function(item, done) {
+      // Update the sentAt time each retry so the tracking-api doesn't interperet a time skew
+      item.sentAt = new Date();
+      // send
+      send(item.url, item.msg, item.headers, function(err, res) {
+        self.debug('sent %O, received %O', item.msg, arguments);
+        if (err) return done(err);
+        res.url = item.url;
+        done();
+      });
+    });
+    this._lsqueue.start();
+  }
+
   this.ready();
   this.analytics.on('invoke', function(msg) {
     var action = msg.action();
@@ -7755,6 +7781,21 @@ Segment.prototype.initialize = function() {
     if (self[listener]) self[listener](msg);
     self.ready();
   });
+  // Migrate from old cross domain id cookie names
+  if (this.cookie('segment_cross_domain_id')) {
+    this.cookie('seg_xid', this.cookie('segment_cross_domain_id'));
+    this.cookie('seg_xid_fd', this.cookie('segment_cross_domain_id_from_domain'));
+    this.cookie('seg_xid_ts', this.cookie('segment_cross_domain_id_timestamp'));
+    this.cookie('segment_cross_domain_id', null);
+    this.cookie('segment_cross_domain_id_from_domain', null);
+    this.cookie('segment_cross_domain_id_timestamp', null);
+  }
+  // At this moment we intentionally do not want events to be queued while we retrieve the `crossDomainId`
+  // so `.ready` will get called right away and we'll try to figure out `crossDomainId`
+  // separately
+  if (this.options.crossDomainIdServers && this.options.crossDomainIdServers.length > 0) {
+    this.retrieveCrossDomainId();
+  }
 };
 
 /**
@@ -7851,14 +7892,45 @@ Segment.prototype.normalize = function(msg) {
   msg.writeKey = this.options.apiKey;
   ctx.userAgent = navigator.userAgent;
   if (!ctx.library) ctx.library = { name: 'analytics.js', version: this.analytics.VERSION };
-  if (query) ctx.campaign = utm(query);
+  var crossDomainId = this.cookie('seg_xid');
+  if (crossDomainId) {
+    if (!ctx.traits) {
+      ctx.traits = { crossDomainId: crossDomainId };
+    } else if (!ctx.traits.crossDomainId) {
+      ctx.traits.crossDomainId = crossDomainId;
+    }
+  }
+  // if user provides campaign via context, do not overwrite with UTM qs param
+  if (query && !ctx.campaign) {
+    ctx.campaign = utm(query);
+  }
   this.referrerId(query, ctx);
   msg.userId = msg.userId || user.id();
   msg.anonymousId = user.anonymousId();
-  msg.messageId = uuid();
   msg.sentAt = new Date();
+  if (this.options.addBundledMetadata) {
+    var bundled = keys(this.analytics.Integrations);
+    msg._metadata = {
+      bundled: bundled,
+      unbundled: this.options.unbundledIntegrations
+    };
+  }
+  // add some randomness to the messageId checksum
+  msg.messageId = 'ajs-' + md5(json.stringify(msg) + uuid());
   this.debug('normalized %o', msg);
+  this.ampId(ctx);
   return msg;
+};
+
+/**
+ * Add amp id if it exists.
+ *
+ * @param {Object} ctx
+ */
+
+Segment.prototype.ampId = function(ctx) {
+  var ampId = this.cookie('segment_amp_id');
+  if (ampId) ctx.amp = { id: ampId };
 };
 
 /**
@@ -7871,8 +7943,7 @@ Segment.prototype.normalize = function(msg) {
  */
 
 Segment.prototype.send = function(path, msg, fn) {
-  var url = scheme() + '//api.segment.io/v1' + path;
-  var headers = { 'Content-Type': 'text/plain' };
+  var url = 'https://' + this.options.apiHost + path;
   fn = fn || noop;
   var self = this;
 
@@ -7880,12 +7951,37 @@ Segment.prototype.send = function(path, msg, fn) {
   msg = this.normalize(msg);
 
   // send
-  send(url, msg, headers, function(err, res) {
-    self.debug('sent %O, received %O', msg, arguments);
-    if (err) return fn(err);
-    res.url = url;
-    fn(null, res);
-  });
+  if (this.options.retryQueue) {
+    var headers = { 'Content-Type': 'text/plain' };
+    this._lsqueue.addItem({
+      url: url,
+      headers: headers,
+      msg: msg
+    });
+  } else if (this.options.beacon && navigator.sendBeacon) {
+    // Beacon returns false if the browser couldn't queue the data for transfer
+    // (e.g: the data was too big)
+    if (navigator.sendBeacon(url, json.stringify(msg))) {
+      self.debug('beacon sent %o', msg);
+      fn();
+    } else {
+      self.debug('beacon failed, falling back to ajax %o', msg);
+      sendAjax();
+    }
+  } else {
+    sendAjax();
+  }
+
+  function sendAjax() {
+    // Beacons are sent as a text/plain POST
+    var headers = { 'Content-Type': 'text/plain' };
+    send(url, msg, headers, function(err, res) {
+      self.debug('ajax sent %o, received %o', msg, arguments);
+      if (err) return fn(err);
+      res.url = url;
+      fn(null, res);
+    });
+  }
 };
 
 /**
@@ -7938,2230 +8034,166 @@ Segment.prototype.referrerId = function(query, ctx) {
   this.cookie('s:context.referrer', json.stringify(ad));
 };
 
+
 /**
- * Get the scheme.
- *
- * The function returns `http:`
- * if the protocol is `http:` and
- * `https:` for other protocols.
+ * retrieveCrossDomainId.
  *
  * @api private
- * @return {string}
+ * @param {function) callback => err, {crossDomainId, fromServer, timestamp}
  */
+Segment.prototype.retrieveCrossDomainId = function(callback) {
+  if (!this.options.crossDomainIdServers) {
+    if (callback) {
+      callback('crossDomainId not enabled', null);
+    }
+    return;
+  }
+  if (!this.cookie('seg_xid')) {
+    var self = this;
+    var writeKey = this.options.apiKey;
 
-function scheme() {
-  return protocol() === 'http:' ? 'http:' : 'https:';
+    // Exclude the current domain from the list of servers we're querying
+    var currentTld = getTld(window.location.hostname);
+    var domains = [];
+    for (var i=0; i<this.options.crossDomainIdServers.length; i++) {
+      var domain = this.options.crossDomainIdServers[i];
+      if (getTld(domain) !== currentTld) {
+        domains.push(domain);
+      }
+    }
+
+    getCrossDomainIdFromServerList(domains, writeKey, function(err, res) {
+      if (err) {
+        // We optimize for no conflicting xid as much as possible. So bail out if there is an
+        // error and we cannot be sure that xid does not exist on any other domains
+        if (callback) {
+          callback(err, null);
+        }
+        return;
+      }
+      var crossDomainId = null;
+      var fromDomain = null;
+      if (res) {
+        crossDomainId = res.id;
+        fromDomain = res.domain;
+      } else {
+        crossDomainId = uuid();
+        fromDomain = window.location.hostname;
+      }
+      var currentTimeMillis = (new Date()).getTime();
+      self.cookie('seg_xid', crossDomainId);
+      // Not actively used. Saving for future conflict resolution purposes
+      self.cookie('seg_xid_fd', fromDomain);
+      self.cookie('seg_xid_ts', currentTimeMillis);
+      self.analytics.identify({
+        crossDomainId: crossDomainId
+      });
+      if (callback) {
+        callback(null, {
+          crossDomainId: crossDomainId,
+          fromDomain: fromDomain,
+          timestamp: currentTimeMillis
+        });
+      }
+    });
+  }
+};
+
+/**
+ * getCrossDomainIdFromServers
+ * @param {Array} domains
+ * @param {string} writeKey
+ * @param {function} callback => err, {domain, id}
+ */
+function getCrossDomainIdFromServerList(domains, writeKey, callback) {
+  // Should not happen but special case
+  if (domains.length === 0) {
+    callback(null, null);
+  }
+  var crossDomainIdFound = false;
+  var finishedRequests = 0;
+  var error = null;
+  for (var i=0; i<domains.length; i++) {
+    var domain = domains[i];
+
+    getCrossDomainIdFromSingleServer(domain, writeKey, function(err, res) {
+      finishedRequests++;
+      if (err) {
+        // if request against a particular domain fails, we won't early exit
+        // but rather wait and see if requests to other domains succeed
+        error = err;
+      } else if (res && res.id && !crossDomainIdFound) {
+        // If we found an xid from any of the servers, we'll just early exit and callback
+        crossDomainIdFound = true;
+        callback(null, res);
+      }
+      if (finishedRequests === domains.length && !crossDomainIdFound) {
+        // Error is non-null if we encountered an issue, otherwise error will be null
+        // meaning that no domains in the list has an xid for current user
+        callback(error, null);
+      }
+    });
+  }
 }
+
+/**
+ * getCrossDomainId
+ * @param {Array} domain
+ * @param {string} writeKey
+ * @param {function} callback => err, {domain, id}
+ */
+function getCrossDomainIdFromSingleServer(domain, writeKey, callback) {
+  var endpoint = 'https://' + domain + '/v1/id/' + writeKey;
+  getJson(endpoint, function(err, res) {
+    if (err) {
+      callback(err, null);
+    } else {
+      callback(null, {
+        domain: domain,
+        id: res && res.id || null
+      });
+    }
+  });
+}
+
+/**
+ * getJson
+ * @param {string} url
+ * @param {function} callback => err, json
+ */
+function getJson(url, callback) {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', url, true);
+  xhr.withCredentials = true;
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState === XMLHttpRequest.DONE) {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        callback(null, xhr.responseText ? json.parse(xhr.responseText) : null);
+      } else {
+        callback(xhr.statusText || 'Unknown Error', null);
+      }
+    }
+  };
+  xhr.send();
+}
+
+//
+/**
+ * getTld
+ * Get domain.com from subdomain.domain.com, etc.
+ * @param {string} domain
+ */
+function getTld(domain) {
+  return domain.split('.').splice(-2).join('.');
+}
+
 
 /**
  * Noop.
  */
-
 function noop() {}
 
-}, {"ad-params":83,"clone":13,"cookie":57,"extend":72,"analytics.js-integration":84,"segmentio/json@1.0.0":58,"store":85,"protocol":86,"send-json":87,"top-domain":88,"utm-params":89,"uuid":81}],
-83: [function(require, module, exports) {
-/**
- * Module dependencies.
- */
- 
-var parse = require('querystring').parse;
- 
-/**
- * Expose `ads`
- */
- 
-module.exports = ads;
- 
-/**
- * All the ad query params we look for.
- */
- 
-var QUERYIDS = {
-  'btid' : 'dataxu',
-  'urid' : 'millennial-media'
-};
- 
-/**
- * Get all ads info from the given `querystring`
- *
- * @param {String} query
- * @return {Object}
- * @api private
- */
- 
-function ads(query){
-  var params = parse(query);
-  for (var key in params) {
-    for (var id in QUERYIDS) {
-      if (key === id) {
-        return {
-          id : params[key],
-          type : QUERYIDS[id]
-        };
-      }
-    }
-  }
-}
-}, {"querystring":28}],
-84: [function(require, module, exports) {
-
-/**
- * Module dependencies.
- */
-
-var bind = require('bind');
-var clone = require('clone');
-var debug = require('debug');
-var defaults = require('defaults');
-var extend = require('extend');
-var slug = require('slug');
-var protos = require('./protos');
-var statics = require('./statics');
-
-/**
- * Create a new `Integration` constructor.
- *
- * @constructs Integration
- * @param {string} name
- * @return {Function} Integration
- */
-
-function createIntegration(name){
-  /**
-   * Initialize a new `Integration`.
-   *
-   * @class
-   * @param {Object} options
-   */
-
-  function Integration(options){
-    if (options && options.addIntegration) {
-      // plugin
-      return options.addIntegration(Integration);
-    }
-    this.debug = debug('analytics:integration:' + slug(name));
-    this.options = defaults(clone(options) || {}, this.defaults);
-    this._queue = [];
-    this.once('ready', bind(this, this.flush));
-
-    Integration.emit('construct', this);
-    this.ready = bind(this, this.ready);
-    this._wrapInitialize();
-    this._wrapPage();
-    this._wrapTrack();
-  }
-
-  Integration.prototype.defaults = {};
-  Integration.prototype.globals = [];
-  Integration.prototype.templates = {};
-  Integration.prototype.name = name;
-  extend(Integration, statics);
-  extend(Integration.prototype, protos);
-
-  return Integration;
-}
-
-/**
- * Exports.
- */
-
-module.exports = createIntegration;
-
-}, {"bind":90,"clone":13,"debug":91,"defaults":16,"extend":92,"slug":93,"./protos":94,"./statics":95}],
-90: [function(require, module, exports) {
-
-var bind = require('bind')
-  , bindAll = require('bind-all');
-
-
-/**
- * Expose `bind`.
- */
-
-module.exports = exports = bind;
-
-
-/**
- * Expose `bindAll`.
- */
-
-exports.all = bindAll;
-
-
-/**
- * Expose `bindMethods`.
- */
-
-exports.methods = bindMethods;
-
-
-/**
- * Bind `methods` on `obj` to always be called with the `obj` as context.
- *
- * @param {Object} obj
- * @param {String} methods...
- */
-
-function bindMethods (obj, methods) {
-  methods = [].slice.call(arguments, 1);
-  for (var i = 0, method; method = methods[i]; i++) {
-    obj[method] = bind(obj, obj[method]);
-  }
-  return obj;
-}
-}, {"bind":55}],
-91: [function(require, module, exports) {
-if ('undefined' == typeof window) {
-  module.exports = require('./lib/debug');
-} else {
-  module.exports = require('./debug');
-}
-
-}, {"./lib/debug":96,"./debug":97}],
-96: [function(require, module, exports) {
-/**
- * Module dependencies.
- */
-
-var tty = require('tty');
-
-/**
- * Expose `debug()` as the module.
- */
-
-module.exports = debug;
-
-/**
- * Enabled debuggers.
- */
-
-var names = []
-  , skips = [];
-
-(process.env.DEBUG || '')
-  .split(/[\s,]+/)
-  .forEach(function(name){
-    name = name.replace('*', '.*?');
-    if (name[0] === '-') {
-      skips.push(new RegExp('^' + name.substr(1) + '$'));
-    } else {
-      names.push(new RegExp('^' + name + '$'));
-    }
-  });
-
-/**
- * Colors.
- */
-
-var colors = [6, 2, 3, 4, 5, 1];
-
-/**
- * Previous debug() call.
- */
-
-var prev = {};
-
-/**
- * Previously assigned color.
- */
-
-var prevColor = 0;
-
-/**
- * Is stdout a TTY? Colored output is disabled when `true`.
- */
-
-var isatty = tty.isatty(2);
-
-/**
- * Select a color.
- *
- * @return {Number}
- * @api private
- */
-
-function color() {
-  return colors[prevColor++ % colors.length];
-}
-
-/**
- * Humanize the given `ms`.
- *
- * @param {Number} m
- * @return {String}
- * @api private
- */
-
-function humanize(ms) {
-  var sec = 1000
-    , min = 60 * 1000
-    , hour = 60 * min;
-
-  if (ms >= hour) return (ms / hour).toFixed(1) + 'h';
-  if (ms >= min) return (ms / min).toFixed(1) + 'm';
-  if (ms >= sec) return (ms / sec | 0) + 's';
-  return ms + 'ms';
-}
-
-/**
- * Create a debugger with the given `name`.
- *
- * @param {String} name
- * @return {Type}
- * @api public
- */
-
-function debug(name) {
-  function disabled(){}
-  disabled.enabled = false;
-
-  var match = skips.some(function(re){
-    return re.test(name);
-  });
-
-  if (match) return disabled;
-
-  match = names.some(function(re){
-    return re.test(name);
-  });
-
-  if (!match) return disabled;
-  var c = color();
-
-  function colored(fmt) {
-    fmt = coerce(fmt);
-
-    var curr = new Date;
-    var ms = curr - (prev[name] || curr);
-    prev[name] = curr;
-
-    fmt = '  \u001b[9' + c + 'm' + name + ' '
-      + '\u001b[3' + c + 'm\u001b[90m'
-      + fmt + '\u001b[3' + c + 'm'
-      + ' +' + humanize(ms) + '\u001b[0m';
-
-    console.error.apply(this, arguments);
-  }
-
-  function plain(fmt) {
-    fmt = coerce(fmt);
-
-    fmt = new Date().toUTCString()
-      + ' ' + name + ' ' + fmt;
-    console.error.apply(this, arguments);
-  }
-
-  colored.enabled = plain.enabled = true;
-
-  return isatty || process.env.DEBUG_COLORS
-    ? colored
-    : plain;
-}
-
-/**
- * Coerce `val`.
- */
-
-function coerce(val) {
-  if (val instanceof Error) return val.stack || val.message;
-  return val;
-}
-
 }, {}],
-97: [function(require, module, exports) {
-
-/**
- * Expose `debug()` as the module.
- */
-
-module.exports = debug;
-
-/**
- * Create a debugger with the given `name`.
- *
- * @param {String} name
- * @return {Type}
- * @api public
- */
-
-function debug(name) {
-  if (!debug.enabled(name)) return function(){};
-
-  return function(fmt){
-    fmt = coerce(fmt);
-
-    var curr = new Date;
-    var ms = curr - (debug[name] || curr);
-    debug[name] = curr;
-
-    fmt = name
-      + ' '
-      + fmt
-      + ' +' + debug.humanize(ms);
-
-    // This hackery is required for IE8
-    // where `console.log` doesn't have 'apply'
-    window.console
-      && console.log
-      && Function.prototype.apply.call(console.log, console, arguments);
-  }
-}
-
-/**
- * The currently active debug mode names.
- */
-
-debug.names = [];
-debug.skips = [];
-
-/**
- * Enables a debug mode by name. This can include modes
- * separated by a colon and wildcards.
- *
- * @param {String} name
- * @api public
- */
-
-debug.enable = function(name) {
-  try {
-    localStorage.debug = name;
-  } catch(e){}
-
-  var split = (name || '').split(/[\s,]+/)
-    , len = split.length;
-
-  for (var i = 0; i < len; i++) {
-    name = split[i].replace('*', '.*?');
-    if (name[0] === '-') {
-      debug.skips.push(new RegExp('^' + name.substr(1) + '$'));
-    }
-    else {
-      debug.names.push(new RegExp('^' + name + '$'));
-    }
-  }
-};
-
-/**
- * Disable debug output.
- *
- * @api public
- */
-
-debug.disable = function(){
-  debug.enable('');
-};
-
-/**
- * Humanize the given `ms`.
- *
- * @param {Number} m
- * @return {String}
- * @api private
- */
-
-debug.humanize = function(ms) {
-  var sec = 1000
-    , min = 60 * 1000
-    , hour = 60 * min;
-
-  if (ms >= hour) return (ms / hour).toFixed(1) + 'h';
-  if (ms >= min) return (ms / min).toFixed(1) + 'm';
-  if (ms >= sec) return (ms / sec | 0) + 's';
-  return ms + 'ms';
-};
-
-/**
- * Returns true if the given mode name is enabled, false otherwise.
- *
- * @param {String} name
- * @return {Boolean}
- * @api public
- */
-
-debug.enabled = function(name) {
-  for (var i = 0, len = debug.skips.length; i < len; i++) {
-    if (debug.skips[i].test(name)) {
-      return false;
-    }
-  }
-  for (var i = 0, len = debug.names.length; i < len; i++) {
-    if (debug.names[i].test(name)) {
-      return true;
-    }
-  }
-  return false;
-};
-
-/**
- * Coerce `val`.
- */
-
-function coerce(val) {
-  if (val instanceof Error) return val.stack || val.message;
-  return val;
-}
-
-// persist
-
-try {
-  if (window.localStorage) debug.enable(localStorage.debug);
-} catch(e){}
-
-}, {}],
-92: [function(require, module, exports) {
-
-module.exports = function extend (object) {
-    // Takes an unlimited number of extenders.
-    var args = Array.prototype.slice.call(arguments, 1);
-
-    // For each extender, copy their properties on our object.
-    for (var i = 0, source; source = args[i]; i++) {
-        if (!source) continue;
-        for (var property in source) {
-            object[property] = source[property];
-        }
-    }
-
-    return object;
-};
-}, {}],
-93: [function(require, module, exports) {
-
-/**
- * Generate a slug from the given `str`.
- *
- * example:
- *
- *        generate('foo bar');
- *        // > foo-bar
- *
- * @param {String} str
- * @param {Object} options
- * @config {String|RegExp} [replace] characters to replace, defaulted to `/[^a-z0-9]/g`
- * @config {String} [separator] separator to insert, defaulted to `-`
- * @return {String}
- */
-
-module.exports = function (str, options) {
-  options || (options = {});
-  return str.toLowerCase()
-    .replace(options.replace || /[^a-z0-9]/g, ' ')
-    .replace(/^ +| +$/g, '')
-    .replace(/ +/g, options.separator || '-')
-};
-
-}, {}],
-94: [function(require, module, exports) {
-/* global setInterval:true setTimeout:true */
-
-/**
- * Module dependencies.
- */
-
-var Emitter = require('emitter');
-var after = require('after');
-var each = require('each');
-var events = require('analytics-events');
-var fmt = require('fmt');
-var foldl = require('foldl');
-var loadIframe = require('load-iframe');
-var loadScript = require('load-script');
-var normalize = require('to-no-case');
-var nextTick = require('next-tick');
-var type = require('type');
-
-/**
- * Noop.
- */
-
-function noop(){}
-
-/**
- * hasOwnProperty reference.
- */
-
-var has = Object.prototype.hasOwnProperty;
-
-/**
- * Window defaults.
- */
-
-var onerror = window.onerror;
-var onload = null;
-var setInterval = window.setInterval;
-var setTimeout = window.setTimeout;
-
-/**
- * Mixin emitter.
- */
-
-/* eslint-disable new-cap */
-Emitter(exports);
-/* eslint-enable new-cap */
-
-/**
- * Initialize.
- */
-
-exports.initialize = function(){
-  var ready = this.ready;
-  nextTick(ready);
-};
-
-/**
- * Loaded?
- *
- * @api private
- * @return {boolean}
- */
-
-exports.loaded = function(){
-  return false;
-};
-
-/**
- * Page.
- *
- * @api public
- * @param {Page} page
- */
-
-/* eslint-disable no-unused-vars */
-exports.page = function(page){};
-/* eslint-enable no-unused-vars */
-
-/**
- * Track.
- *
- * @api public
- * @param {Track} track
- */
-
-/* eslint-disable no-unused-vars */
-exports.track = function(track){};
-/* eslint-enable no-unused-vars */
-
-/**
- * Get events that match `event`.
- *
- * @api public
- * @param {Object|Object[]} events An object or array of objects pulled from
- * settings.mapping.
- * @param {string} event The name of the event whose metdata we're looking for.
- * @return {Array} An array of settings that match the input `event` name.
- * @example
- * var events = { my_event: 'a4991b88' };
- * .map(events, 'My Event');
- * // => ["a4991b88"]
- * .map(events, 'whatever');
- * // => []
- *
- * var events = [{ key: 'my event', value: '9b5eb1fa' }];
- * .map(events, 'my_event');
- * // => ["9b5eb1fa"]
- * .map(events, 'whatever');
- * // => []
- */
-
-exports.map = function(events, event){
-  var normalizedEvent = normalize(event);
-
-  return foldl(function(matchingEvents, val, key, events) {
-    // If true, this is a `mixed` value, which is structured like so:
-    //     { key: 'testEvent', value: { event: 'testEvent', someValue: 'xyz' } }
-    // We need to extract the key, which we use to match against
-    // `normalizedEvent`, and return `value` as part of `matchingEvents` if that
-    // match succeds.
-    if (type(events) === 'array') {
-      // If there's no key attached to this event mapping (unusual), skip this
-      // item.
-      if (!val.key) return matchingEvents;
-      // Extract the key and value from the `mixed` object.
-      key = val.key;
-      val = val.value;
-    }
-
-    if (normalize(key) === normalizedEvent) {
-      matchingEvents.push(val);
-    }
-
-    return matchingEvents;
-  }, [], events);
-};
-
-/**
- * Invoke a `method` that may or may not exist on the prototype with `args`,
- * queueing or not depending on whether the integration is "ready". Don't
- * trust the method call, since it contains integration party code.
- *
- * @api private
- * @param {string} method
- * @param {...*} args
- */
-
-exports.invoke = function(method){
-  if (!this[method]) return;
-  var args = Array.prototype.slice.call(arguments, 1);
-  if (!this._ready) return this.queue(method, args);
-  var ret;
-
-  try {
-    this.debug('%s with %o', method, args);
-    ret = this[method].apply(this, args);
-  } catch (e) {
-    this.debug('error %o calling %s with %o', e, method, args);
-  }
-
-  return ret;
-};
-
-/**
- * Queue a `method` with `args`. If the integration assumes an initial
- * pageview, then let the first call to `page` pass through.
- *
- * @api private
- * @param {string} method
- * @param {Array} args
- */
-
-exports.queue = function(method, args){
-  if (method === 'page' && this._assumesPageview && !this._initialized) {
-    return this.page.apply(this, args);
-  }
-
-  this._queue.push({ method: method, args: args });
-};
-
-/**
- * Flush the internal queue.
- *
- * @api private
- */
-
-exports.flush = function(){
-  this._ready = true;
-  var self = this;
-
-  each(this._queue, function(call){
-    self[call.method].apply(self, call.args);
-  });
-
-  // Empty the queue.
-  this._queue.length = 0;
-};
-
-/**
- * Reset the integration, removing its global variables.
- *
- * @api private
- */
-
-exports.reset = function(){
-  for (var i = 0; i < this.globals.length; i++) {
-    window[this.globals[i]] = undefined;
-  }
-
-  window.setTimeout = setTimeout;
-  window.setInterval = setInterval;
-  window.onerror = onerror;
-  window.onload = onload;
-};
-
-/**
- * Load a tag by `name`.
- *
- * @param {string} name The name of the tag.
- * @param {Object} locals Locals used to populate the tag's template variables
- * (e.g. `userId` in '<img src="https://whatever.com/{{ userId }}">').
- * @param {Function} [callback=noop] A callback, invoked when the tag finishes
- * loading.
- */
-
-exports.load = function(name, locals, callback){
-  // Argument shuffling
-  if (typeof name === 'function') { callback = name; locals = null; name = null; }
-  if (name && typeof name === 'object') { callback = locals; locals = name; name = null; }
-  if (typeof locals === 'function') { callback = locals; locals = null; }
-
-  // Default arguments
-  name = name || 'library';
-  locals = locals || {};
-
-  locals = this.locals(locals);
-  var template = this.templates[name];
-  if (!template) throw new Error(fmt('template "%s" not defined.', name));
-  var attrs = render(template, locals);
-  callback = callback || noop;
-  var self = this;
-  var el;
-
-  switch (template.type) {
-    case 'img':
-      attrs.width = 1;
-      attrs.height = 1;
-      el = loadImage(attrs, callback);
-      break;
-    case 'script':
-      el = loadScript(attrs, function(err){
-        if (!err) return callback();
-        self.debug('error loading "%s" error="%s"', self.name, err);
-      });
-      // TODO: hack until refactoring load-script
-      delete attrs.src;
-      each(attrs, function(key, val){
-        el.setAttribute(key, val);
-      });
-      break;
-    case 'iframe':
-      el = loadIframe(attrs, callback);
-      break;
-    default:
-      // No default case
-  }
-
-  return el;
-};
-
-/**
- * Locals for tag templates.
- *
- * By default it includes a cache buster and all of the options.
- *
- * @param {Object} [locals]
- * @return {Object}
- */
-
-exports.locals = function(locals){
-  locals = locals || {};
-  var cache = Math.floor(new Date().getTime() / 3600000);
-  if (!locals.hasOwnProperty('cache')) locals.cache = cache;
-  each(this.options, function(key, val){
-    if (!locals.hasOwnProperty(key)) locals[key] = val;
-  });
-  return locals;
-};
-
-/**
- * Simple way to emit ready.
- *
- * @api public
- */
-
-exports.ready = function(){
-  this.emit('ready');
-};
-
-/**
- * Wrap the initialize method in an exists check, so we don't have to do it for
- * every single integration.
- *
- * @api private
- */
-
-exports._wrapInitialize = function(){
-  var initialize = this.initialize;
-  this.initialize = function(){
-    this.debug('initialize');
-    this._initialized = true;
-    var ret = initialize.apply(this, arguments);
-    this.emit('initialize');
-    return ret;
-  };
-
-  if (this._assumesPageview) this.initialize = after(2, this.initialize);
-};
-
-/**
- * Wrap the page method to call `initialize` instead if the integration assumes
- * a pageview.
- *
- * @api private
- */
-
-exports._wrapPage = function(){
-  var page = this.page;
-  this.page = function(){
-    if (this._assumesPageview && !this._initialized) {
-      return this.initialize.apply(this, arguments);
-    }
-
-    return page.apply(this, arguments);
-  };
-};
-
-/**
- * Wrap the track method to call other ecommerce methods if available depending
- * on the `track.event()`.
- *
- * @api private
- */
-
-exports._wrapTrack = function(){
-  var t = this.track;
-  this.track = function(track){
-    var event = track.event();
-    var called;
-    var ret;
-
-    for (var method in events) {
-      if (has.call(events, method)) {
-        var regexp = events[method];
-        if (!this[method]) continue;
-        if (!regexp.test(event)) continue;
-        ret = this[method].apply(this, arguments);
-        called = true;
-        break;
-      }
-    }
-
-    if (!called) ret = t.apply(this, arguments);
-    return ret;
-  };
-};
-
-/**
- * TODO: Document me
- *
- * @api private
- * @param {Object} attrs
- * @param {Function} fn
- * @return {undefined}
- */
-
-function loadImage(attrs, fn){
-  fn = fn || function(){};
-  var img = new Image();
-  img.onerror = error(fn, 'failed to load pixel', img);
-  img.onload = function(){ fn(); };
-  img.src = attrs.src;
-  img.width = 1;
-  img.height = 1;
-  return img;
-}
-
-/**
- * TODO: Document me
- *
- * @api private
- * @param {Function} fn
- * @param {string} message
- * @param {Element} img
- * @return {Function}
- */
-
-function error(fn, message, img){
-  return function(e){
-    e = e || window.event;
-    var err = new Error(message);
-    err.event = e;
-    err.source = img;
-    fn(err);
-  };
-}
-
-/**
- * Render template + locals into an `attrs` object.
- *
- * @api private
- * @param {Object} template
- * @param {Object} locals
- * @return {Object}
- */
-
-function render(template, locals){
-  return foldl(function(attrs, val, key) {
-    attrs[key] = val.replace(/\{\{\ *(\w+)\ *\}\}/g, function(_, $1){
-      return locals[$1];
-    });
-    return attrs;
-  }, {}, template.attrs);
-}
-
-}, {"emitter":8,"after":10,"each":98,"analytics-events":99,"fmt":100,"foldl":17,"load-iframe":101,"load-script":102,"to-no-case":103,"next-tick":56,"type":104}],
-98: [function(require, module, exports) {
-
-/**
- * Module dependencies.
- */
-
-try {
-  var type = require('type');
-} catch (err) {
-  var type = require('component-type');
-}
-
-var toFunction = require('to-function');
-
-/**
- * HOP reference.
- */
-
-var has = Object.prototype.hasOwnProperty;
-
-/**
- * Iterate the given `obj` and invoke `fn(val, i)`
- * in optional context `ctx`.
- *
- * @param {String|Array|Object} obj
- * @param {Function} fn
- * @param {Object} [ctx]
- * @api public
- */
-
-module.exports = function(obj, fn, ctx){
-  fn = toFunction(fn);
-  ctx = ctx || this;
-  switch (type(obj)) {
-    case 'array':
-      return array(obj, fn, ctx);
-    case 'object':
-      if ('number' == typeof obj.length) return array(obj, fn, ctx);
-      return object(obj, fn, ctx);
-    case 'string':
-      return string(obj, fn, ctx);
-  }
-};
-
-/**
- * Iterate string chars.
- *
- * @param {String} obj
- * @param {Function} fn
- * @param {Object} ctx
- * @api private
- */
-
-function string(obj, fn, ctx) {
-  for (var i = 0; i < obj.length; ++i) {
-    fn.call(ctx, obj.charAt(i), i);
-  }
-}
-
-/**
- * Iterate object keys.
- *
- * @param {Object} obj
- * @param {Function} fn
- * @param {Object} ctx
- * @api private
- */
-
-function object(obj, fn, ctx) {
-  for (var key in obj) {
-    if (has.call(obj, key)) {
-      fn.call(ctx, key, obj[key]);
-    }
-  }
-}
-
-/**
- * Iterate array-ish.
- *
- * @param {Array|Object} obj
- * @param {Function} fn
- * @param {Object} ctx
- * @api private
- */
-
-function array(obj, fn, ctx) {
-  for (var i = 0; i < obj.length; ++i) {
-    fn.call(ctx, obj[i], i);
-  }
-}
-
-}, {"type":104,"component-type":104,"to-function":76}],
-104: [function(require, module, exports) {
-
-/**
- * toString ref.
- */
-
-var toString = Object.prototype.toString;
-
-/**
- * Return the type of `val`.
- *
- * @param {Mixed} val
- * @return {String}
- * @api public
- */
-
-module.exports = function(val){
-  switch (toString.call(val)) {
-    case '[object Function]': return 'function';
-    case '[object Date]': return 'date';
-    case '[object RegExp]': return 'regexp';
-    case '[object Arguments]': return 'arguments';
-    case '[object Array]': return 'array';
-    case '[object String]': return 'string';
-  }
-
-  if (val === null) return 'null';
-  if (val === undefined) return 'undefined';
-  if (val && val.nodeType === 1) return 'element';
-  if (val === Object(val)) return 'object';
-
-  return typeof val;
-};
-
-}, {}],
-99: [function(require, module, exports) {
-
-module.exports = {
-  removedProduct: /^[ _]?removed[ _]?product[ _]?$/i,
-  viewedProduct: /^[ _]?viewed[ _]?product[ _]?$/i,
-  viewedProductCategory: /^[ _]?viewed[ _]?product[ _]?category[ _]?$/i,
-  addedProduct: /^[ _]?added[ _]?product[ _]?$/i,
-  completedOrder: /^[ _]?completed[ _]?order[ _]?$/i,
-  startedOrder: /^[ _]?started[ _]?order[ _]?$/i,
-  updatedOrder: /^[ _]?updated[ _]?order[ _]?$/i,
-  refundedOrder: /^[ _]?refunded?[ _]?order[ _]?$/i,
-  viewedProductDetails: /^[ _]?viewed[ _]?product[ _]?details?[ _]?$/i,
-  clickedProduct: /^[ _]?clicked[ _]?product[ _]?$/i,
-  viewedPromotion: /^[ _]?viewed[ _]?promotion?[ _]?$/i,
-  clickedPromotion: /^[ _]?clicked[ _]?promotion?[ _]?$/i,
-  viewedCheckoutStep: /^[ _]?viewed[ _]?checkout[ _]?step[ _]?$/i,
-  completedCheckoutStep: /^[ _]?completed[ _]?checkout[ _]?step[ _]?$/i
-};
-
-}, {}],
-100: [function(require, module, exports) {
-
-/**
- * toString.
- */
-
-var toString = window.JSON
-  ? JSON.stringify
-  : function(_){ return String(_); };
-
-/**
- * Export `fmt`
- */
-
-module.exports = fmt;
-
-/**
- * Formatters
- */
-
-fmt.o = toString;
-fmt.s = String;
-fmt.d = parseInt;
-
-/**
- * Format the given `str`.
- *
- * @param {String} str
- * @param {...} args
- * @return {String}
- * @api public
- */
-
-function fmt(str){
-  var args = [].slice.call(arguments, 1);
-  var j = 0;
-
-  return str.replace(/%([a-z])/gi, function(_, f){
-    return fmt[f]
-      ? fmt[f](args[j++])
-      : _ + f;
-  });
-}
-
-}, {}],
-101: [function(require, module, exports) {
-
-/**
- * Module dependencies.
- */
-
-var onload = require('script-onload');
-var tick = require('next-tick');
-var type = require('type');
-
-/**
- * Expose `loadScript`.
- *
- * @param {Object} options
- * @param {Function} fn
- * @api public
- */
-
-module.exports = function loadIframe(options, fn){
-  if (!options) throw new Error('Cant load nothing...');
-
-  // Allow for the simplest case, just passing a `src` string.
-  if ('string' == type(options)) options = { src : options };
-
-  var https = document.location.protocol === 'https:' ||
-              document.location.protocol === 'chrome-extension:';
-
-  // If you use protocol relative URLs, third-party scripts like Google
-  // Analytics break when testing with `file:` so this fixes that.
-  if (options.src && options.src.indexOf('//') === 0) {
-    options.src = https ? 'https:' + options.src : 'http:' + options.src;
-  }
-
-  // Allow them to pass in different URLs depending on the protocol.
-  if (https && options.https) options.src = options.https;
-  else if (!https && options.http) options.src = options.http;
-
-  // Make the `<iframe>` element and insert it before the first iframe on the
-  // page, which is guaranteed to exist since this Javaiframe is running.
-  var iframe = document.createElement('iframe');
-  iframe.src = options.src;
-  iframe.width = options.width || 1;
-  iframe.height = options.height || 1;
-  iframe.style.display = 'none';
-
-  // If we have a fn, attach event handlers, even in IE. Based off of
-  // the Third-Party Javascript script loading example:
-  // https://github.com/thirdpartyjs/thirdpartyjs-code/blob/master/examples/templates/02/loading-files/index.html
-  if ('function' == type(fn)) {
-    onload(iframe, fn);
-  }
-
-  tick(function(){
-    // Append after event listeners are attached for IE.
-    var firstScript = document.getElementsByTagName('script')[0];
-    firstScript.parentNode.insertBefore(iframe, firstScript);
-  });
-
-  // Return the iframe element in case they want to do anything special, like
-  // give it an ID or attributes.
-  return iframe;
-};
-}, {"script-onload":105,"next-tick":56,"type":47}],
-105: [function(require, module, exports) {
-
-// https://github.com/thirdpartyjs/thirdpartyjs-code/blob/master/examples/templates/02/loading-files/index.html
-
-/**
- * Invoke `fn(err)` when the given `el` script loads.
- *
- * @param {Element} el
- * @param {Function} fn
- * @api public
- */
-
-module.exports = function(el, fn){
-  return el.addEventListener
-    ? add(el, fn)
-    : attach(el, fn);
-};
-
-/**
- * Add event listener to `el`, `fn()`.
- *
- * @param {Element} el
- * @param {Function} fn
- * @api private
- */
-
-function add(el, fn){
-  el.addEventListener('load', function(_, e){ fn(null, e); }, false);
-  el.addEventListener('error', function(e){
-    var err = new Error('script error "' + el.src + '"');
-    err.event = e;
-    fn(err);
-  }, false);
-}
-
-/**
- * Attach event.
- *
- * @param {Element} el
- * @param {Function} fn
- * @api private
- */
-
-function attach(el, fn){
-  el.attachEvent('onreadystatechange', function(e){
-    if (!/complete|loaded/.test(el.readyState)) return;
-    fn(null, e);
-  });
-  el.attachEvent('onerror', function(e){
-    var err = new Error('failed to load the script "' + el.src + '"');
-    err.event = e || window.event;
-    fn(err);
-  });
-}
-
-}, {}],
-102: [function(require, module, exports) {
-
-/**
- * Module dependencies.
- */
-
-var onload = require('script-onload');
-var tick = require('next-tick');
-var type = require('type');
-
-/**
- * Expose `loadScript`.
- *
- * @param {Object} options
- * @param {Function} fn
- * @api public
- */
-
-module.exports = function loadScript(options, fn){
-  if (!options) throw new Error('Cant load nothing...');
-
-  // Allow for the simplest case, just passing a `src` string.
-  if ('string' == type(options)) options = { src : options };
-
-  var https = document.location.protocol === 'https:' ||
-              document.location.protocol === 'chrome-extension:';
-
-  // If you use protocol relative URLs, third-party scripts like Google
-  // Analytics break when testing with `file:` so this fixes that.
-  if (options.src && options.src.indexOf('//') === 0) {
-    options.src = https ? 'https:' + options.src : 'http:' + options.src;
-  }
-
-  // Allow them to pass in different URLs depending on the protocol.
-  if (https && options.https) options.src = options.https;
-  else if (!https && options.http) options.src = options.http;
-
-  // Make the `<script>` element and insert it before the first script on the
-  // page, which is guaranteed to exist since this Javascript is running.
-  var script = document.createElement('script');
-  script.type = 'text/javascript';
-  script.async = true;
-  script.src = options.src;
-
-  // If we have a fn, attach event handlers, even in IE. Based off of
-  // the Third-Party Javascript script loading example:
-  // https://github.com/thirdpartyjs/thirdpartyjs-code/blob/master/examples/templates/02/loading-files/index.html
-  if ('function' == type(fn)) {
-    onload(script, fn);
-  }
-
-  tick(function(){
-    // Append after event listeners are attached for IE.
-    var firstScript = document.getElementsByTagName('script')[0];
-    firstScript.parentNode.insertBefore(script, firstScript);
-  });
-
-  // Return the script element in case they want to do anything special, like
-  // give it an ID or attributes.
-  return script;
-};
-}, {"script-onload":105,"next-tick":56,"type":47}],
-103: [function(require, module, exports) {
-
-/**
- * Expose `toNoCase`.
- */
-
-module.exports = toNoCase;
-
-
-/**
- * Test whether a string is camel-case.
- */
-
-var hasSpace = /\s/;
-var hasSeparator = /[\W_]/;
-
-
-/**
- * Remove any starting case from a `string`, like camel or snake, but keep
- * spaces and punctuation that may be important otherwise.
- *
- * @param {String} string
- * @return {String}
- */
-
-function toNoCase (string) {
-  if (hasSpace.test(string)) return string.toLowerCase();
-  if (hasSeparator.test(string)) return unseparate(string).toLowerCase();
-  return uncamelize(string).toLowerCase();
-}
-
-
-/**
- * Separator splitter.
- */
-
-var separatorSplitter = /[\W_]+(.|$)/g;
-
-
-/**
- * Un-separate a `string`.
- *
- * @param {String} string
- * @return {String}
- */
-
-function unseparate (string) {
-  return string.replace(separatorSplitter, function (m, next) {
-    return next ? ' ' + next : '';
-  });
-}
-
-
-/**
- * Camelcase splitter.
- */
-
-var camelSplitter = /(.)([A-Z]+)/g;
-
-
-/**
- * Un-camelcase a `string`.
- *
- * @param {String} string
- * @return {String}
- */
-
-function uncamelize (string) {
-  return string.replace(camelSplitter, function (m, previous, uppers) {
-    return previous + ' ' + uppers.toLowerCase().split('').join(' ');
-  });
-}
-}, {}],
-95: [function(require, module, exports) {
-
-/**
- * Module dependencies.
- */
-
-var Emitter = require('emitter');
-var domify = require('domify');
-var each = require('each');
-var includes = require('includes');
-
-/**
- * Mix in emitter.
- */
-
-/* eslint-disable new-cap */
-Emitter(exports);
-/* eslint-enable new-cap */
-
-/**
- * Add a new option to the integration by `key` with default `value`.
- *
- * @api public
- * @param {string} key
- * @param {*} value
- * @return {Integration}
- */
-
-exports.option = function(key, value){
-  this.prototype.defaults[key] = value;
-  return this;
-};
-
-/**
- * Add a new mapping option.
- *
- * This will create a method `name` that will return a mapping for you to use.
- *
- * @api public
- * @param {string} name
- * @return {Integration}
- * @example
- * Integration('My Integration')
- *   .mapping('events');
- *
- * new MyIntegration().track('My Event');
- *
- * .track = function(track){
- *   var events = this.events(track.event());
- *   each(events, send);
- *  };
- */
-
-exports.mapping = function(name){
-  this.option(name, []);
-  this.prototype[name] = function(str){
-    return this.map(this.options[name], str);
-  };
-  return this;
-};
-
-/**
- * Register a new global variable `key` owned by the integration, which will be
- * used to test whether the integration is already on the page.
- *
- * @api public
- * @param {string} key
- * @return {Integration}
- */
-
-exports.global = function(key){
-  this.prototype.globals.push(key);
-  return this;
-};
-
-/**
- * Mark the integration as assuming an initial pageview, so to defer loading
- * the script until the first `page` call, noop the first `initialize`.
- *
- * @api public
- * @return {Integration}
- */
-
-exports.assumesPageview = function(){
-  this.prototype._assumesPageview = true;
-  return this;
-};
-
-/**
- * Mark the integration as being "ready" once `load` is called.
- *
- * @api public
- * @return {Integration}
- */
-
-exports.readyOnLoad = function(){
-  this.prototype._readyOnLoad = true;
-  return this;
-};
-
-/**
- * Mark the integration as being "ready" once `initialize` is called.
- *
- * @api public
- * @return {Integration}
- */
-
-exports.readyOnInitialize = function(){
-  this.prototype._readyOnInitialize = true;
-  return this;
-};
-
-/**
- * Define a tag to be loaded.
- *
- * @api public
- * @param {string} [name='library'] A nicename for the tag, commonly used in
- * #load. Helpful when the integration has multiple tags and you need a way to
- * specify which of the tags you want to load at a given time.
- * @param {String} str DOM tag as string or URL.
- * @return {Integration}
- */
-
-exports.tag = function(name, tag){
-  if (tag == null) {
-    tag = name;
-    name = 'library';
-  }
-  this.prototype.templates[name] = objectify(tag);
-  return this;
-};
-
-/**
- * Given a string, give back DOM attributes.
- *
- * Do it in a way where the browser doesn't load images or iframes. It turns
- * out domify will load images/iframes because whenever you construct those
- * DOM elements, the browser immediately loads them.
- *
- * @api private
- * @param {string} str
- * @return {Object}
- */
-
-function objectify(str) {
-  // replace `src` with `data-src` to prevent image loading
-  str = str.replace(' src="', ' data-src="');
-
-  var el = domify(str);
-  var attrs = {};
-
-  each(el.attributes, function(attr){
-    // then replace it back
-    var name = attr.name === 'data-src' ? 'src' : attr.name;
-    if (!includes(attr.name + '=', str)) return;
-    attrs[name] = attr.value;
-  });
-
-  return {
-    type: el.tagName.toLowerCase(),
-    attrs: attrs
-  };
-}
-
-}, {"emitter":8,"domify":106,"each":98,"includes":74}],
-106: [function(require, module, exports) {
-
-/**
- * Expose `parse`.
- */
-
-module.exports = parse;
-
-/**
- * Tests for browser support.
- */
-
-var div = document.createElement('div');
-// Setup
-div.innerHTML = '  <link/><table></table><a href="/a">a</a><input type="checkbox"/>';
-// Make sure that link elements get serialized correctly by innerHTML
-// This requires a wrapper element in IE
-var innerHTMLBug = !div.getElementsByTagName('link').length;
-div = undefined;
-
-/**
- * Wrap map from jquery.
- */
-
-var map = {
-  legend: [1, '<fieldset>', '</fieldset>'],
-  tr: [2, '<table><tbody>', '</tbody></table>'],
-  col: [2, '<table><tbody></tbody><colgroup>', '</colgroup></table>'],
-  // for script/link/style tags to work in IE6-8, you have to wrap
-  // in a div with a non-whitespace character in front, ha!
-  _default: innerHTMLBug ? [1, 'X<div>', '</div>'] : [0, '', '']
-};
-
-map.td =
-map.th = [3, '<table><tbody><tr>', '</tr></tbody></table>'];
-
-map.option =
-map.optgroup = [1, '<select multiple="multiple">', '</select>'];
-
-map.thead =
-map.tbody =
-map.colgroup =
-map.caption =
-map.tfoot = [1, '<table>', '</table>'];
-
-map.polyline =
-map.ellipse =
-map.polygon =
-map.circle =
-map.text =
-map.line =
-map.path =
-map.rect =
-map.g = [1, '<svg xmlns="http://www.w3.org/2000/svg" version="1.1">','</svg>'];
-
-/**
- * Parse `html` and return a DOM Node instance, which could be a TextNode,
- * HTML DOM Node of some kind (<div> for example), or a DocumentFragment
- * instance, depending on the contents of the `html` string.
- *
- * @param {String} html - HTML string to "domify"
- * @param {Document} doc - The `document` instance to create the Node for
- * @return {DOMNode} the TextNode, DOM Node, or DocumentFragment instance
- * @api private
- */
-
-function parse(html, doc) {
-  if ('string' != typeof html) throw new TypeError('String expected');
-
-  // default to the global `document` object
-  if (!doc) doc = document;
-
-  // tag name
-  var m = /<([\w:]+)/.exec(html);
-  if (!m) return doc.createTextNode(html);
-
-  html = html.replace(/^\s+|\s+$/g, ''); // Remove leading/trailing whitespace
-
-  var tag = m[1];
-
-  // body support
-  if (tag == 'body') {
-    var el = doc.createElement('html');
-    el.innerHTML = html;
-    return el.removeChild(el.lastChild);
-  }
-
-  // wrap map
-  var wrap = map[tag] || map._default;
-  var depth = wrap[0];
-  var prefix = wrap[1];
-  var suffix = wrap[2];
-  var el = doc.createElement('div');
-  el.innerHTML = prefix + html + suffix;
-  while (depth--) el = el.lastChild;
-
-  // one element
-  if (el.firstChild == el.lastChild) {
-    return el.removeChild(el.firstChild);
-  }
-
-  // several elements
-  var fragment = doc.createDocumentFragment();
-  while (el.firstChild) {
-    fragment.appendChild(el.removeChild(el.firstChild));
-  }
-
-  return fragment;
-}
-
-}, {}],
-85: [function(require, module, exports) {
-
-/**
- * dependencies.
- */
-
-var unserialize = require('unserialize');
-var each = require('each');
-var storage;
-
-/**
- * Safari throws when a user
- * blocks access to cookies / localstorage.
- */
-
-try {
-  storage = window.localStorage;
-} catch (e) {
-  storage = null;
-}
-
-/**
- * Expose `store`
- */
-
-module.exports = store;
-
-/**
- * Store the given `key`, `val`.
- *
- * @param {String|Object} key
- * @param {Mixed} value
- * @return {Mixed}
- * @api public
- */
-
-function store(key, value){
-  var length = arguments.length;
-  if (0 == length) return all();
-  if (2 <= length) return set(key, value);
-  if (1 != length) return;
-  if (null == key) return storage.clear();
-  if ('string' == typeof key) return get(key);
-  if ('object' == typeof key) return each(key, set);
-}
-
-/**
- * supported flag.
- */
-
-store.supported = !! storage;
-
-/**
- * Set `key` to `val`.
- *
- * @param {String} key
- * @param {Mixed} val
- */
-
-function set(key, val){
-  return null == val
-    ? storage.removeItem(key)
-    : storage.setItem(key, JSON.stringify(val));
-}
-
-/**
- * Get `key`.
- *
- * @param {String} key
- * @return {Mixed}
- */
-
-function get(key){
-  return unserialize(storage.getItem(key));
-}
-
-/**
- * Get all.
- *
- * @return {Object}
- */
-
-function all(){
-  var len = storage.length;
-  var ret = {};
-  var key;
-
-  while (0 <= --len) {
-    key = storage.key(len);
-    ret[key] = get(key);
-  }
-
-  return ret;
-}
-
-}, {"unserialize":107,"each":98}],
-107: [function(require, module, exports) {
-
-/**
- * Unserialize the given "stringified" javascript.
- * 
- * @param {String} val
- * @return {Mixed}
- */
-
-module.exports = function(val){
-  try {
-    return JSON.parse(val);
-  } catch (e) {
-    return val || undefined;
-  }
-};
-
-}, {}],
-86: [function(require, module, exports) {
-
-/**
- * Convenience alias
- */
-
-var define = Object.defineProperty;
-
-
-/**
- *  The base protocol
- */
-
-var initialProtocol = window.location.protocol;
-
-/**
- * Fallback mocked protocol in case Object.defineProperty doesn't exist.
- */
-
-var mockedProtocol;
-
-
-module.exports = function (protocol) {
-  if (arguments.length === 0) return get();
-  else return set(protocol);
-};
-
-
-/**
- * Sets the protocol to be http:
- */
-
-module.exports.http = function () {
-  set('http:');
-};
-
-
-/**
- * Sets the protocol to be https:
- */
-
-module.exports.https = function () {
-  set('https:');
-};
-
-
-/**
- * Reset to the initial protocol.
- */
-
-module.exports.reset = function () {
-  set(initialProtocol);
-};
-
-
-/**
- * Gets the current protocol, using the fallback and then the native protocol.
- *
- * @return {String} protocol
- */
-
-function get () {
-  return mockedProtocol || window.location.protocol;
-}
-
-
-/**
- * Sets the protocol
- *
- * @param {String} protocol
- */
-
-function set (protocol) {
-  try {
-    define(window.location, 'protocol', {
-      get: function () { return protocol; }
-    });
-  } catch (err) {
-    mockedProtocol = protocol;
-  }
-}
-
-}, {}],
-87: [function(require, module, exports) {
-/**
- * Module dependencies.
- */
-
-var encode = require('base64-encode');
-var cors = require('has-cors');
-var jsonp = require('jsonp');
-var JSON = require('json');
-
-/**
- * Expose `send`
- */
-
-exports = module.exports = cors
-  ? json
-  : base64;
-
-/**
- * Expose `callback`
- */
-
-exports.callback = 'callback';
-
-/**
- * Expose `prefix`
- */
-
-exports.prefix = 'data';
-
-/**
- * Expose `json`.
- */
-
-exports.json = json;
-
-/**
- * Expose `base64`.
- */
-
-exports.base64 = base64;
-
-/**
- * Expose `type`
- */
-
-exports.type = cors
-  ? 'xhr'
-  : 'jsonp';
-
-/**
- * Send the given `obj` to `url` with `fn(err, req)`.
- *
- * @param {String} url
- * @param {Object} obj
- * @param {Object} headers
- * @param {Function} fn
- * @api private
- */
-
-function json(url, obj, headers, fn){
-  if (3 == arguments.length) fn = headers, headers = {};
-
-  var req = new XMLHttpRequest;
-  req.onerror = fn;
-  req.onreadystatechange = done;
-  req.open('POST', url, true);
-  for (var k in headers) req.setRequestHeader(k, headers[k]);
-  req.send(JSON.stringify(obj));
-
-  function done(){
-    if (4 == req.readyState) return fn(null, req);
-  }
-}
-
-/**
- * Send the given `obj` to `url` with `fn(err, req)`.
- *
- * @param {String} url
- * @param {Object} obj
- * @param {Function} fn
- * @api private
- */
-
-function base64(url, obj, _, fn){
-  if (3 == arguments.length) fn = _;
-  var prefix = exports.prefix;
-  obj = encode(JSON.stringify(obj));
-  obj = encodeURIComponent(obj);
-  url += '?' + prefix + '=' + obj;
-  jsonp(url, { param: exports.callback }, function(err, obj){
-    if (err) return fn(err);
-    fn(null, {
-      url: url,
-      body: obj
-    });
-  });
-}
-
-}, {"base64-encode":108,"has-cors":109,"jsonp":110,"json":58}],
-108: [function(require, module, exports) {
-var utf8Encode = require('utf8-encode');
-var keyStr = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
-
-module.exports = encode;
-function encode(input) {
-    var output = "";
-    var chr1, chr2, chr3, enc1, enc2, enc3, enc4;
-    var i = 0;
-
-    input = utf8Encode(input);
-
-    while (i < input.length) {
-
-        chr1 = input.charCodeAt(i++);
-        chr2 = input.charCodeAt(i++);
-        chr3 = input.charCodeAt(i++);
-
-        enc1 = chr1 >> 2;
-        enc2 = ((chr1 & 3) << 4) | (chr2 >> 4);
-        enc3 = ((chr2 & 15) << 2) | (chr3 >> 6);
-        enc4 = chr3 & 63;
-
-        if (isNaN(chr2)) {
-            enc3 = enc4 = 64;
-        } else if (isNaN(chr3)) {
-            enc4 = 64;
-        }
-
-        output = output +
-            keyStr.charAt(enc1) + keyStr.charAt(enc2) +
-            keyStr.charAt(enc3) + keyStr.charAt(enc4);
-
-    }
-
-    return output;
-}
-}, {"utf8-encode":111}],
-111: [function(require, module, exports) {
-module.exports = encode;
-
-function encode(string) {
-    string = string.replace(/\r\n/g, "\n");
-    var utftext = "";
-
-    for (var n = 0; n < string.length; n++) {
-
-        var c = string.charCodeAt(n);
-
-        if (c < 128) {
-            utftext += String.fromCharCode(c);
-        }
-        else if ((c > 127) && (c < 2048)) {
-            utftext += String.fromCharCode((c >> 6) | 192);
-            utftext += String.fromCharCode((c & 63) | 128);
-        }
-        else {
-            utftext += String.fromCharCode((c >> 12) | 224);
-            utftext += String.fromCharCode(((c >> 6) & 63) | 128);
-            utftext += String.fromCharCode((c & 63) | 128);
-        }
-
-    }
-
-    return utftext;
-}
-}, {}],
-109: [function(require, module, exports) {
-
-/**
- * Module exports.
- *
- * Logic borrowed from Modernizr:
- *
- *   - https://github.com/Modernizr/Modernizr/blob/master/feature-detects/cors.js
- */
-
-try {
-  module.exports = typeof XMLHttpRequest !== 'undefined' &&
-    'withCredentials' in new XMLHttpRequest();
-} catch (err) {
-  // if XMLHttp support is disabled in IE then it will throw
-  // when trying to create
-  module.exports = false;
-}
-
-}, {}],
-110: [function(require, module, exports) {
-/**
- * Module dependencies
- */
-
-var debug = require('debug')('jsonp');
-
-/**
- * Module exports.
- */
-
-module.exports = jsonp;
-
-/**
- * Callback index.
- */
-
-var count = 0;
-
-/**
- * Noop function.
- */
-
-function noop(){}
-
-/**
- * JSONP handler
- *
- * Options:
- *  - param {String} qs parameter (`callback`)
- *  - timeout {Number} how long after a timeout error is emitted (`60000`)
- *
- * @param {String} url
- * @param {Object|Function} optional options / callback
- * @param {Function} optional callback
- */
-
-function jsonp(url, opts, fn){
-  if ('function' == typeof opts) {
-    fn = opts;
-    opts = {};
-  }
-  if (!opts) opts = {};
-
-  var prefix = opts.prefix || '__jp';
-  var param = opts.param || 'callback';
-  var timeout = null != opts.timeout ? opts.timeout : 60000;
-  var enc = encodeURIComponent;
-  var target = document.getElementsByTagName('script')[0] || document.head;
-  var script;
-  var timer;
-
-  // generate a unique id for this request
-  var id = prefix + (count++);
-
-  if (timeout) {
-    timer = setTimeout(function(){
-      cleanup();
-      if (fn) fn(new Error('Timeout'));
-    }, timeout);
-  }
-
-  function cleanup(){
-    script.parentNode.removeChild(script);
-    window[id] = noop;
-  }
-
-  window[id] = function(data){
-    debug('jsonp got', data);
-    if (timer) clearTimeout(timer);
-    cleanup();
-    if (fn) fn(null, data);
-  };
-
-  // add qs component
-  url += (~url.indexOf('?') ? '&' : '?') + param + '=' + enc(id);
-  url = url.replace('?&', '?');
-
-  debug('jsonp req "%s"', url);
-
-  // create script
-  script = document.createElement('script');
-  script.src = url;
-  target.parentNode.insertBefore(script, target);
-}
-
-}, {"debug":15}],
-88: [function(require, module, exports) {
-
-/**
- * Module dependencies.
- */
-
-var parse = require('url').parse;
-
-/**
- * Expose `domain`
- */
-
-module.exports = domain;
-
-/**
- * RegExp
- */
-
-var regexp = /[a-z0-9][a-z0-9\-]*[a-z0-9]\.[a-z\.]{2,6}$/i;
-
-/**
- * Get the top domain.
- * 
- * Official Grammar: http://tools.ietf.org/html/rfc883#page-56
- * Look for tlds with up to 2-6 characters.
- * 
- * Example:
- * 
- *      domain('http://localhost:3000/baz');
- *      // => ''
- *      domain('http://dev:3000/baz');
- *      // => ''
- *      domain('http://127.0.0.1:3000/baz');
- *      // => ''
- *      domain('http://segment.io/baz');
- *      // => 'segment.io'
- * 
- * @param {String} url
- * @return {String}
- * @api public
- */
-
-function domain(url){
-  var host = parse(url).hostname;
-  var match = host.match(regexp);
-  return match ? match[0] : '';
-};
-
-}, {"url":63}],
-89: [function(require, module, exports) {
-
-/**
- * Module dependencies.
- */
-
-var parse = require('querystring').parse;
-
-/**
- * Expose `utm`
- */
-
-module.exports = utm;
-
-/**
- * Get all utm params from the given `querystring`
- *
- * @param {String} query
- * @return {Object}
- * @api private
- */
-
-function utm(query){
-  if ('?' == query.charAt(0)) query = query.substring(1);
-  var query = query.replace(/\?/g, '&');
-  var params = parse(query);
-  var param;
-  var ret = {};
-
-  for (var key in params) {
-    if (~key.indexOf('utm_')) {
-      param = key.substr(4);
-      if ('campaign' == param) param = 'name';
-      ret[param] = params[key];
-    }
-  }
-
-  return ret;
-}
-
-}, {"querystring":28}],
 5: [function(require, module, exports) {
 module.exports = {
   "name": "analytics",
